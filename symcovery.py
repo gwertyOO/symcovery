@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from volatility3.framework import exceptions, interfaces, renderers
 from volatility3.framework.configuration import requirements
@@ -58,21 +58,34 @@ class LinuxSymbolRecovery(PluginInterface):
             )
         return int(init_task)
 
+    def _find_comm_signature_offset(self, data: bytes, signatures: Sequence[bytes]) -> tuple[int, bytes]:
+        for signature in signatures:
+            offset = data.find(signature)
+            if offset >= 0:
+                return offset, signature
+
+        raise exceptions.VolatilityException(
+            "Unable to locate a supported init task comm signature within scan window from init_task"
+        )
+
     def _recover_comm_offset(self, layer_name: str, init_task: int, max_scan_size: int) -> RecoveredField:
         layer = self.context.layers[layer_name]
-        swapper_signature = b"swapper\x00"
         data = layer.read(init_task, max_scan_size, pad=True)
 
-        offset = data.find(swapper_signature)
-        if offset < 0:
-            raise exceptions.VolatilityException(
-                "Unable to locate 'swapper' string within scan window from init_task"
-            )
+        signatures: Sequence[bytes] = (
+            b"swapper\x00",
+            b"swapper/0\x00",
+            b"swapper/",
+        )
+        offset, matched_signature = self._find_comm_signature_offset(data, signatures)
 
         return RecoveredField(
             name="comm",
             offset=offset,
-            details=f"Matched 'swapper' signature at +0x{offset:x}",
+            details=(
+                "Matched init task comm signature "
+                f"{matched_signature!r} at +0x{offset:x}"
+            ),
         )
 
     def _iter_pointer_candidates(
@@ -111,7 +124,7 @@ class LinuxSymbolRecovery(PluginInterface):
     def _recover_initial_fields(self, module_name: str, init_task: int, max_scan_size: int) -> list[RecoveredField]:
         kernel = self.context.modules[module_name]
         layer_name = kernel.layer_name
-        pointer_size = self.context.layers[layer_name].address_mask.bit_length() // 8
+        pointer_size = max(4, (self.context.layers[layer_name].address_mask.bit_length() + 1) // 8)
         if pointer_size not in (4, 8):
             pointer_size = 8
 
