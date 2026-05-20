@@ -19,10 +19,19 @@ class RecoveredField:
     details: str
 
 
+@dataclass(frozen=True)
+class CandidateField:
+    """Represents a field with multiple possible offsets."""
+
+    name: str
+    offsets: tuple[int, ...]
+    details: str
+
+
 class LinuxSymbolRecovery(PluginInterface):
     """Recovers initial Linux task_struct offsets from a provided init_task address."""
 
-    _version = (0, 1, 0)
+    _version = (0, 2, 0)
     _required_framework_version = (2, 0, 0)
 
     @classmethod
@@ -90,34 +99,114 @@ class LinuxSymbolRecovery(PluginInterface):
 
     def _iter_pointer_candidates(
         self, layer_name: str, init_task: int, max_scan_size: int, pointer_size: int
-    ) -> Iterable[int]:
+    ) -> Iterable[tuple[int, int]]:
         layer = self.context.layers[layer_name]
         data = layer.read(init_task, max_scan_size, pad=True)
 
         for offset in range(0, max_scan_size - pointer_size + 1, pointer_size):
             value = int.from_bytes(data[offset : offset + pointer_size], byteorder="little", signed=False)
-            if value == init_task:
-                yield offset
+            yield offset, value
 
-    def _recover_parent_offset(
+    def _recover_parent_candidates(
         self, layer_name: str, init_task: int, max_scan_size: int, pointer_size: int
-    ) -> RecoveredField:
-        candidates = list(
-            self._iter_pointer_candidates(layer_name, init_task, max_scan_size, pointer_size)
-        )
+    ) -> CandidateField:
+        candidates = [
+            offset
+            for offset, value in self._iter_pointer_candidates(layer_name, init_task, max_scan_size, pointer_size)
+            if value == init_task
+        ]
         if not candidates:
             raise exceptions.VolatilityException(
                 "Unable to identify pointer-sized fields that self-reference init_task"
             )
 
-        # For init_task, real_parent/parent are expected to self-reference.
-        parent_offset = min(candidates)
-        return RecoveredField(
-            name="parent",
-            offset=parent_offset,
+        return CandidateField(
+            name="parent_or_real_parent_or_group_leader",
+            offsets=tuple(candidates),
             details=(
-                f"Detected self-referential pointer at +0x{parent_offset:x}; "
-                f"all candidates: {', '.join(hex(candidate) for candidate in candidates)}"
+                "Self-referential pointer candidates in init_task; these commonly include "
+                "real_parent, parent, and group_leader"
+            ),
+        )
+
+    def _recover_children_candidates(
+        self,
+        layer_name: str,
+        init_task: int,
+        max_scan_size: int,
+        pointer_size: int,
+        comm_offset: int,
+    ) -> CandidateField:
+        layer = self.context.layers[layer_name]
+        candidates: list[int] = []
+
+        for offset, value in self._iter_pointer_candidates(layer_name, init_task, max_scan_size, pointer_size):
+            if value == init_task:
+                continue
+
+            # Heuristic: children list head points to first child's sibling list_head.
+            # If so, nearby memory around that pointer should contain a parent-like pointer to init_task.
+            try:
+                neighbor = layer.read(value - (pointer_size * 8), pointer_size * 16, pad=True)
+            except exceptions.InvalidAddressException:
+                continue
+
+            has_backref = False
+            for scan_offset in range(0, len(neighbor) - pointer_size + 1, pointer_size):
+                ptr = int.from_bytes(
+                    neighbor[scan_offset : scan_offset + pointer_size],
+                    byteorder="little",
+                    signed=False,
+                )
+                if ptr == init_task:
+                    has_backref = True
+                    break
+
+            if not has_backref:
+                continue
+
+            # Optional consistency check: infer a possible task start from an "init" comm nearby.
+            # This is only used as an additional filter and does not hardcode field ordering.
+            inferred_ok = False
+            try:
+                scan_blob = layer.read(value - 0x600, 0xC00, pad=True)
+            except exceptions.InvalidAddressException:
+                scan_blob = b""
+
+            init_name_hits = [scan_blob.find(b"init\x00"), scan_blob.find(b"init/")]
+            for hit in init_name_hits:
+                if hit < 0:
+                    continue
+                inferred_task_start = (value - 0x600) + hit - comm_offset
+                if inferred_task_start <= 0:
+                    continue
+                try:
+                    marker = layer.read(inferred_task_start + comm_offset, 5, pad=True)
+                except exceptions.InvalidAddressException:
+                    continue
+                if marker.startswith(b"init"):
+                    inferred_ok = True
+                    break
+
+            if inferred_ok:
+                candidates.append(offset)
+
+        if not candidates:
+            return CandidateField(
+                name="children_candidate",
+                offsets=tuple(),
+                details=(
+                    "No strong children candidates found yet; need broader cross-task checks "
+                    "in later recovery stages"
+                ),
+            )
+
+        return CandidateField(
+            name="children_candidate",
+            offsets=tuple(sorted(set(candidates))),
+            details=(
+                "Pointer candidates whose targets look like child sibling-list nodes with "
+                "an init_task back-reference nearby"
             ),
         )
 
@@ -129,9 +218,36 @@ class LinuxSymbolRecovery(PluginInterface):
             pointer_size = 8
 
         comm = self._recover_comm_offset(layer_name, init_task, max_scan_size)
-        parent = self._recover_parent_offset(layer_name, init_task, max_scan_size, pointer_size)
+        parent_candidates = self._recover_parent_candidates(
+            layer_name, init_task, max_scan_size, pointer_size
+        )
+        children_candidates = self._recover_children_candidates(
+            layer_name, init_task, max_scan_size, pointer_size, comm.offset
+        )
 
-        return [comm, parent]
+        return [
+            comm,
+            RecoveredField(
+                name=parent_candidates.name,
+                offset=parent_candidates.offsets[0],
+                details=(
+                    f"candidate offsets: {', '.join(hex(o) for o in parent_candidates.offsets)}; "
+                    f"{parent_candidates.details}"
+                ),
+            ),
+            RecoveredField(
+                name=children_candidates.name,
+                offset=children_candidates.offsets[0] if children_candidates.offsets else -1,
+                details=(
+                    (
+                        f"candidate offsets: {', '.join(hex(o) for o in children_candidates.offsets)}; "
+                        if children_candidates.offsets
+                        else "candidate offsets: none; "
+                    )
+                    + children_candidates.details
+                ),
+            ),
+        ]
 
     def _generator(self):
         module_name = self.config["kernel"]
@@ -141,7 +257,8 @@ class LinuxSymbolRecovery(PluginInterface):
         recovered_fields = self._recover_initial_fields(module_name, init_task, max_scan_size)
 
         for recovered in recovered_fields:
-            yield (0, (recovered.name, hex(recovered.offset), recovered.details))
+            offset_repr = "n/a" if recovered.offset < 0 else hex(recovered.offset)
+            yield (0, (recovered.name, offset_repr, recovered.details))
 
     def run(self) -> renderers.TreeGrid:
         return renderers.TreeGrid(
