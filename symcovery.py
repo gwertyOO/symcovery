@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence
+from typing import Dict, Iterable, Optional, Sequence
 
 from volatility3.framework import exceptions, interfaces, renderers
 from volatility3.framework.configuration import requirements
@@ -25,7 +25,7 @@ class CandidateField:
 
 
 class LinuxSymbolRecovery(PluginInterface):
-    _version = (0, 4, 0)
+    _version = (0, 5, 0)
     _required_framework_version = (2, 0, 0)
 
     @classmethod
@@ -42,6 +42,32 @@ class LinuxSymbolRecovery(PluginInterface):
             raise exceptions.VolatilityException("Automatic init_task discovery is not implemented yet. Please provide --init-task.")
         return int(init_task)
 
+    def _read_pointer(self, layer_name: str, address: int, pointer_size: int) -> Optional[int]:
+        try:
+            return int.from_bytes(self.context.layers[layer_name].read(address, pointer_size, pad=True), "little", signed=False)
+        except exceptions.InvalidAddressException:
+            return None
+
+    def _read_u32(self, layer_name: str, address: int) -> Optional[int]:
+        try:
+            return int.from_bytes(self.context.layers[layer_name].read(address, 4, pad=True), "little", signed=False)
+        except exceptions.InvalidAddressException:
+            return None
+
+    def _read_comm(self, layer_name: str, task_start: int, comm_offset: int, max_len: int = 16) -> str:
+        try:
+            data = self.context.layers[layer_name].read(task_start + comm_offset, max_len, pad=True)
+        except exceptions.InvalidAddressException:
+            return "<invalid>"
+        raw = data.split(b"\x00", 1)[0]
+        try:
+            return raw.decode("ascii", errors="replace")
+        except Exception:
+            return "<decode-error>"
+
+    def _looks_like_kernel_pointer(self, value: int) -> bool:
+        return value >= 0xFFFF000000000000
+
     def _find_comm_signature_offset(self, data: bytes, signatures: Sequence[bytes]) -> tuple[int, bytes]:
         for signature in signatures:
             offset = data.find(signature)
@@ -50,19 +76,9 @@ class LinuxSymbolRecovery(PluginInterface):
         raise exceptions.VolatilityException("Unable to locate a supported init_task comm signature")
 
     def _iter_pointer_candidates(self, layer_name: str, init_task: int, max_scan_size: int, pointer_size: int) -> Iterable[tuple[int, int]]:
-        layer = self.context.layers[layer_name]
-        blob = layer.read(init_task, max_scan_size, pad=True)
+        blob = self.context.layers[layer_name].read(init_task, max_scan_size, pad=True)
         for off in range(0, max_scan_size - pointer_size + 1, pointer_size):
-            yield off, int.from_bytes(blob[off:off + pointer_size], "little", signed=False)
-
-    def _read_pointer(self, layer_name: str, address: int, pointer_size: int) -> Optional[int]:
-        try:
-            return int.from_bytes(self.context.layers[layer_name].read(address, pointer_size, pad=True), "little", signed=False)
-        except exceptions.InvalidAddressException:
-            return None
-
-    def _looks_like_kernel_pointer(self, value: int) -> bool:
-        return value >= 0xFFFF000000000000
+            yield off, int.from_bytes(blob[off : off + pointer_size], "little", signed=False)
 
     def _recover_comm_offset(self, layer_name: str, init_task: int, max_scan_size: int) -> RecoveredField:
         blob = self.context.layers[layer_name].read(init_task, max_scan_size, pad=True)
@@ -79,12 +95,20 @@ class LinuxSymbolRecovery(PluginInterface):
             if value == init_task or not self._looks_like_kernel_pointer(value):
                 continue
             around = self.context.layers[layer_name].read(value - pointer_size * 8, pointer_size * 16, pad=True)
-            if any(int.from_bytes(around[i:i+pointer_size], "little", signed=False) == init_task for i in range(0, len(around) - pointer_size + 1, pointer_size)):
+            if any(int.from_bytes(around[i : i + pointer_size], "little", signed=False) == init_task for i in range(0, len(around) - pointer_size + 1, pointer_size)):
                 candidates.append(off)
         return CandidateField("children_candidate", tuple(sorted(set(candidates))), "Candidates whose target neighborhood contains back-references to init_task")
 
-    def _validate_relation_candidates(self, layer_name: str, init_task: int, max_scan_size: int, pointer_size: int, parent: CandidateField, children: CandidateField) -> list[RecoveredField]:
-        out: dict[str, RecoveredField] = {}
+    def _relation_tuples(
+        self,
+        layer_name: str,
+        init_task: int,
+        max_scan_size: int,
+        pointer_size: int,
+        parent: CandidateField,
+        children: CandidateField,
+    ) -> list[tuple[int, int, int]]:
+        tuples: list[tuple[int, int, int]] = []
         head_candidates = {init_task + off for off in children.offsets}
         for children_off in children.offsets:
             child_link = self._read_pointer(layer_name, init_task + children_off, pointer_size)
@@ -103,49 +127,141 @@ class LinuxSymbolRecovery(PluginInterface):
                 if sib_prev not in head_candidates and not self._looks_like_kernel_pointer(sib_prev):
                     continue
                 for parent_off in parent.offsets:
-                    if self._read_pointer(layer_name, child_task + parent_off, pointer_size) != init_task:
-                        continue
-                    d = f"children=0x{children_off:x}, sibling=0x{sibling_off:x}, parent-like=0x{parent_off:x} validates child relation"
-                    out[d] = RecoveredField("children_sibling_parent_relation", children_off, d)
-        return list(out.values())
+                    if self._read_pointer(layer_name, child_task + parent_off, pointer_size) == init_task:
+                        tuples.append((children_off, sibling_off, parent_off))
+        return sorted(set(tuples))
 
-    def _recover_id_candidates(self, layer_name: str, init_task: int, max_scan_size: int, pointer_size: int, relations: list[RecoveredField]) -> tuple[CandidateField, CandidateField]:
-        if not relations:
-            return CandidateField("pid_candidate", tuple(), "No validated child relation"), CandidateField("tgid_candidate", tuple(), "No validated child relation")
-        parts = {x.split('=')[0]: int(x.split('=')[1], 16) for x in relations[0].details.replace(',', '').split() if '=' in x and x.split('=')[1].startswith('0x')}
-        children_off, sibling_off = parts['children'], parts['sibling']
-        child_link = self._read_pointer(layer_name, init_task + children_off, pointer_size)
-        if child_link is None:
-            return CandidateField("pid_candidate", tuple(), "Could not follow child link"), CandidateField("tgid_candidate", tuple(), "Could not follow child link")
-        child_task = child_link - sibling_off
-        init_blob = self.context.layers[layer_name].read(init_task, max_scan_size, pad=True)
-        child_blob = self.context.layers[layer_name].read(child_task, max_scan_size, pad=True)
+    def _walk_children_chain(
+        self,
+        layer_name: str,
+        init_task: int,
+        pointer_size: int,
+        children_offset: int,
+        sibling_offset: int,
+        max_tasks: int = 256,
+    ) -> list[int]:
+        tasks: list[int] = []
+        head = init_task + children_offset
+        link = self._read_pointer(layer_name, head, pointer_size)
+        seen_links: set[int] = set()
 
-        pid, tgid = [], []
+        while link is not None and link not in seen_links and link != head and len(tasks) < max_tasks:
+            seen_links.add(link)
+            task = link - sibling_offset
+            if task <= 0:
+                break
+            tasks.append(task)
+            link = self._read_pointer(layer_name, link, pointer_size)
+        return tasks
+
+    def _score_candidates_across_tasks(
+        self,
+        layer_name: str,
+        init_task: int,
+        max_scan_size: int,
+        tasks: list[int],
+    ) -> tuple[Dict[int, int], Dict[int, int]]:
+        pid_scores: Dict[int, int] = {}
+        tgid_scores: Dict[int, int] = {}
+        all_tasks = [init_task] + tasks
         for off in range(0, max_scan_size - 4 + 1, 4):
-            i = int.from_bytes(init_blob[off:off+4], "little", signed=False)
-            c = int.from_bytes(child_blob[off:off+4], "little", signed=False)
-            if i == 0 and 0 < c < 0x100000:
-                pid.append(off)
-                tgid.append(off)
-        return CandidateField("pid_candidate", tuple(pid), "u32 offsets where init=0 and child>0"), CandidateField("tgid_candidate", tuple(tgid), "u32 offsets where init=0 and child>0")
+            values = [self._read_u32(layer_name, task + off) for task in all_tasks]
+            if any(v is None for v in values):
+                continue
+            vals = [v for v in values if v is not None]
+            if vals[0] != 0:
+                continue
+            score = 0
+            if len(vals) >= 2 and vals[1] == 1:
+                score += 10
+            if all(v < 0x100000 for v in vals):
+                score += 3
+            if len(set(vals)) > 1:
+                score += 2
+            if score > 0:
+                pid_scores[off] = score
+            # TGID: often equals PID for kernel threads, still score separately
+            if score >= 3:
+                tgid_scores[off] = score - 1
+        return pid_scores, tgid_scores
 
     def _recover_initial_fields(self, module_name: str, init_task: int, max_scan_size: int) -> list[RecoveredField]:
         layer_name = self.context.modules[module_name].layer_name
         pointer_size = 8 if self.context.layers[layer_name].address_mask > 0xFFFFFFFF else 4
+
         comm = self._recover_comm_offset(layer_name, init_task, max_scan_size)
         parent = self._recover_parent_candidates(layer_name, init_task, max_scan_size, pointer_size)
         children = self._recover_children_candidates(layer_name, init_task, max_scan_size, pointer_size)
-        relations = self._validate_relation_candidates(layer_name, init_task, max_scan_size, pointer_size, parent, children)
-        pid, tgid = self._recover_id_candidates(layer_name, init_task, max_scan_size, pointer_size, relations)
+
+        relation_tuples = self._relation_tuples(layer_name, init_task, max_scan_size, pointer_size, parent, children)
+        relation_rows = [
+            RecoveredField(
+                "children_sibling_parent_relation",
+                c,
+                f"children=0x{c:x}, sibling=0x{s:x}, parent-like=0x{p:x} validates child relation",
+            )
+            for c, s, p in relation_tuples
+        ]
+
+        # scored selection: choose tuple that yields most tasks in children walk
+        best_tuple: Optional[tuple[int, int, int]] = None
+        best_tasks: list[int] = []
+        for c, s, p in relation_tuples:
+            walked = self._walk_children_chain(layer_name, init_task, pointer_size, c, s)
+            if len(walked) > len(best_tasks):
+                best_tasks = walked
+                best_tuple = (c, s, p)
+
+        pid_scores: Dict[int, int] = {}
+        tgid_scores: Dict[int, int] = {}
+        if best_tuple is not None:
+            pid_scores, tgid_scores = self._score_candidates_across_tasks(layer_name, init_task, max_scan_size, best_tasks)
+
+        pid_sorted = tuple(sorted(pid_scores, key=lambda x: pid_scores[x], reverse=True))
+        tgid_sorted = tuple(sorted(tgid_scores, key=lambda x: tgid_scores[x], reverse=True))
+
         rows = [
             comm,
             RecoveredField(parent.name, parent.offsets[0] if parent.offsets else -1, f"candidate offsets: {', '.join(hex(o) for o in parent.offsets) if parent.offsets else 'none'}"),
             RecoveredField(children.name, children.offsets[0] if children.offsets else -1, f"candidate offsets: {', '.join(hex(o) for o in children.offsets) if children.offsets else 'none'}"),
-            RecoveredField(pid.name, pid.offsets[0] if pid.offsets else -1, f"candidate offsets: {', '.join(hex(o) for o in pid.offsets) if pid.offsets else 'none'}; {pid.details}"),
-            RecoveredField(tgid.name, tgid.offsets[0] if tgid.offsets else -1, f"candidate offsets: {', '.join(hex(o) for o in tgid.offsets) if tgid.offsets else 'none'}; {tgid.details}"),
+            RecoveredField(
+                "selected_relation",
+                best_tuple[0] if best_tuple else -1,
+                (
+                    f"selected by max walked tasks: children=0x{best_tuple[0]:x}, sibling=0x{best_tuple[1]:x}, parent-like=0x{best_tuple[2]:x}, walked={len(best_tasks)}"
+                    if best_tuple else "no validated relation tuple"
+                ),
+            ),
+            RecoveredField(
+                "pid_candidate",
+                pid_sorted[0] if pid_sorted else -1,
+                (
+                    "scored offsets: " + ", ".join(f"0x{o:x}(score={pid_scores[o]})" for o in pid_sorted)
+                    if pid_sorted else "scored offsets: none"
+                ),
+            ),
+            RecoveredField(
+                "tgid_candidate",
+                tgid_sorted[0] if tgid_sorted else -1,
+                (
+                    "scored offsets: " + ", ".join(f"0x{o:x}(score={tgid_scores[o]})" for o in tgid_sorted)
+                    if tgid_sorted else "scored offsets: none"
+                ),
+            ),
         ]
-        rows.extend(relations)
+
+        for idx, task in enumerate(best_tasks):
+            name = self._read_comm(layer_name, task, comm.offset)
+            pid_val = self._read_u32(layer_name, task + (pid_sorted[0] if pid_sorted else 0)) if pid_sorted else None
+            rows.append(
+                RecoveredField(
+                    "task_debug",
+                    task,
+                    f"index={idx} task=0x{task:x} comm={name} pid_guess={pid_val if pid_val is not None else 'n/a'}",
+                )
+            )
+
+        rows.extend(relation_rows)
         return rows
 
     def _generator(self):
